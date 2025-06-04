@@ -200,72 +200,7 @@ struct Shape {
     // For example, CuCu----:--------:crCu----:crP-----:crCu----} is
     // creatable in the game. This is considered a bug (SPZ2-3399). Therefore,
     // we go straight to the correct behavior and don't allow such shapes.
-    constexpr T supportedPart() const {
-        T ret = 0;
-        std::vector<size_t> stack;
-
-        auto push = [&](
-                size_t layer,
-                size_t part,
-                bool allowPin,
-                bool allowShape) {
-            Type type = get(layer, part);
-            switch (type) {
-                case Type::Empty:
-                    return;
-                case Type::Pin:
-                    if (!allowPin) {
-                        return;
-                    }
-                    break;
-                case Type::Shape:
-                    if (!allowShape) {
-                        return;
-                    }
-                    break;
-                case Type::Crystal:
-                    break;
-            }
-            size_t idx = layer * PART + part;
-            T mask = T(3) << (idx * 2);
-            if (ret & mask) {
-                return;
-            }
-            ret |= mask;
-            stack.push_back(idx);
-        };
-
-        // it's on the bottom layer of the shape
-        for (size_t part = 0; part < PART; ++part) {
-            push(0, part, true, true);
-        }
-
-        while (!stack.empty()) {
-            size_t idx = stack.back();
-            stack.pop_back();
-            size_t layer = idx / PART;
-            size_t part = idx % PART;
-            Type type = get(layer, part);
-
-            // it's directly above a supported part
-            if (layer + 1 < LAYER) {
-                push(layer + 1, part, true, true);
-            }
-
-            // it's connected horizontally with a supported part
-            if (type == Type::Shape || type == Type::Crystal) {
-                push(layer, (part + 1) % PART, false, true);
-                push(layer, (part + PART - 1) % PART, false, true);
-            }
-
-            // it's a crystal and it's directly under a supported crystal
-            if (type == Type::Crystal && layer > 0) {
-                push(layer - 1, part, false, false);
-            }
-        }
-
-        return ret;
-    }
+    constexpr T supportedPart() const;
 
     // Stack another connected shape on top of this shape.
     // Assume all the crystals have already broken.
@@ -293,22 +228,32 @@ struct Shape {
 
     // Apply shape gravity rules to a shape
     constexpr Shape collapse() const {
+        T mask_x1 = value & repeat<T>(1, 2, LAYER * PART);
+        mask_x1 = mask_x1 | (mask_x1 << 1);
+        T mask_1x = (value >> 1) & repeat<T>(1, 2, LAYER * PART);
+        mask_1x = mask_1x | (mask_1x << 1);
+        T mask_c = mask_1x & mask_x1;  // 0b11 for Type::Crystal
+        T mask_s = mask_1x & ~mask_x1;  // 0b10 for Type::Shape
+        T mask_sc = mask_1x;
+        T mask_psc = mask_1x | mask_x1;
+        T supported = mask_psc & repeat<T>(3, 2, PART);
+        while (true) {
+            T last = supported;
+            T supported_up = supported << (2 * PART);
+            Shape sc{supported & mask_sc};
+            T supported_left_right = sc.rotate(1).value | sc.rotate(PART - 1).value;
+            T supported_down = (supported & mask_c) >> (2 * PART);
+            supported |= (mask_psc & supported_up) | (mask_sc & supported_left_right) | (mask_c & supported_down);
+            if (supported == last) {
+                break;
+            }
+        }
         // No change to supported parts
-        T supported = supportedPart();
         Shape ret{value & supported};
         // Falling parts
         T v = value & ~supported;
         // Crystals in the falling parts break
         v &= ~find<Type::Crystal>();
-
-        // Remove a part from `v` and return it
-        auto extract = [&](size_t layer, size_t part) {
-            size_t idx = layer * PART + part;
-            T mask = T(3) << (2 * idx);
-            T t = v & mask;
-            v &= ~mask;
-            return t;
-        };
 
         // Stack the falling parts on top of the supported parts,
         // from bottom to top
@@ -316,27 +261,25 @@ struct Shape {
             for (size_t part = 0; part < PART; ++part) {
                 Type type = Shape(v).get(layer, part);
                 if (type == Type::Pin) {
-                    // Pin is not connected to any part
-                    ret = ret.stack(Shape(extract(layer, part)));
+                    T connected = T(3) << ((layer * PART + part) * 2);
+                    T t = v & connected;
+                    v &= ~connected;
+                    ret = ret.stack(Shape(t));
                 } else if (type == Type::Shape) {
+                    T connected = T(3) << ((layer * PART + part) * 2);
                     // Find connected parts
-                    T connected = extract(layer, part);
-                    // Find in the reverse direction
-                    if (part == 0) {
-                        for (size_t i = PART - 1;
-                             i > 0 && Shape(v).get(layer, i) == Type::Shape;
-                             --i) {
-                            connected |= extract(layer, i);
+                    while (true) {
+                        T last = connected;
+                        Shape s{connected};
+                        T connected_left_right = s.rotate(1).value | s.rotate(PART - 1).value;
+                        connected |= mask_s & connected_left_right;
+                        if (connected == last) {
+                            break;
                         }
                     }
-                    // Find in the forward direction
-                    while (part + 1 < PART &&
-                           Shape(v).get(layer, part + 1) == Type::Shape) {
-                        ++part;
-                        connected |= extract(layer, part);
-                    }
-                    // Stack the connected parts
-                    ret = ret.stack(Shape(connected));
+                    T t = v & connected;
+                    v &= ~connected;
+                    ret = ret.stack(Shape(t));
                 }
             }
         }
@@ -347,47 +290,21 @@ struct Shape {
     // connected to them
     template <T Mask>
     constexpr Shape breakCrystals() const {
-        T ret = value;
-        std::vector<size_t> stack;
-
-        auto push = [&](size_t layer, size_t part) {
-            Type type = Shape(ret).get(layer, part);
-            if (type != Type::Crystal) {
-                return;
-            }
-            size_t idx = layer * PART + part;
-            T mask = T(3) << (idx * 2);
-            ret &= ~mask;
-            stack.push_back(idx);
-        };
-
-        // break crystals covered by the Mask
-        for (size_t layer = 0; layer < LAYER; ++layer) {
-            for (size_t part = 0; part < PART; ++part) {
-                size_t idx = layer * PART + part;
-                if (Mask & (T(3) << (idx * 2))) {
-                    push(layer, part);
-                }
+        T mask_c = (value & (value >> 1)) & repeat<T>(1, 2, PART * LAYER);
+        mask_c = mask_c | (mask_c << 1);
+        T connected = Mask & mask_c;
+        while (true) {
+            T last = connected;
+            T connected_up = connected << (2 * PART);
+            Shape s{connected};
+            T connected_left_right = s.rotate(1).value | s.rotate(PART - 1).value;
+            T connected_down = connected >> (2 * PART);
+            connected |= mask_c & (connected_up | connected_left_right | connected_down);
+            if (connected == last) {
+                break;
             }
         }
-
-        // break connected crystals
-        while (!stack.empty()) {
-            size_t idx = stack.back();
-            stack.pop_back();
-            size_t layer = idx / PART;
-            size_t part = idx % PART;
-            push(layer, (part + 1) % PART);
-            push(layer, (part + PART - 1) % PART);
-            if (layer > 0) {
-                push(layer - 1, part);
-            }
-            if (layer + 1 < LAYER) {
-                push(layer + 1, part);
-            }
-        }
-
-        return Shape(ret);
+        return Shape(value & ~connected);
     }
 
     // Cut the shape. Returns the west half
@@ -417,15 +334,23 @@ struct Shape {
 
     // Mirror the shape
     constexpr Shape flip() const {
-        T v = 0;
-        for (size_t pa = 0; pa < PART / 2; ++pa) {
-            size_t pb = PART - 1 - pa;
-            T ma = repeat<T>(3, 2 * PART, LAYER) << (pa * 2);
-            T mb = repeat<T>(3, 2 * PART, LAYER) << (pb * 2);
-            v |= (value & ma) << (pb * 2 - pa * 2);
-            v |= (value & mb) >> (pb * 2 - pa * 2);
+        if constexpr (PART == 4) {
+            constexpr int D = (PART/2-1)*2;
+            T ma = repeat<T>(3, 2*PART/2, 2*LAYER);
+            T mb = repeat<T>(3<<D, 2*PART/2, 2*LAYER);
+            T v = ((value & ma) << D) | ((value & mb) >> D);
+            return Shape(v);
+        } else {
+            T v = 0;
+            for (size_t pa = 0; pa < PART / 2; ++pa) {
+                size_t pb = PART - 1 - pa;
+                T ma = repeat<T>(3, 2 * PART, LAYER) << (pa * 2);
+                T mb = repeat<T>(3, 2 * PART, LAYER) << (pb * 2);
+                v |= (value & ma) << (pb * 2 - pa * 2);
+                v |= (value & mb) >> (pb * 2 - pa * 2);
+            }
+            return Shape(v);
         }
-        return Shape(v);
     }
 
     // Normalize pins as the vortex does
@@ -452,6 +377,15 @@ struct Shape {
         return ret;
     }
 
+    Shape equivalentShape() const {
+        std::vector<Shape> ret;
+        for (size_t angle = 0; angle < PART; ++angle) {
+            ret.push_back(rotate(angle));
+            ret.push_back(rotate(angle).flip());
+        }
+        return *std::min_element(ret.begin(), ret.end());
+    }
+
     // All the halves that can be obtained by flip
     std::vector<Shape> equivalentHalves() const {
         Shape flipped = flip().rotate(PART / 2);
@@ -461,6 +395,15 @@ struct Shape {
             return {*this, flipped};
         } else {
             return {*this};
+        }
+    }
+
+    Shape equivalentHalve() const {
+        Shape flipped = flip().rotate(PART / 2);
+        if (flipped < *this) {
+            return flipped;
+        } else {
+            return *this;
         }
     }
 };
