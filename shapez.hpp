@@ -388,7 +388,7 @@ struct Shape {
 
     // All the halves that can be obtained by flip
     std::vector<Shape> equivalentHalves() const {
-        Shape flipped = flip().rotate(PART / 2);
+        Shape flipped = flip();
         if (flipped < *this) {
             return {flipped, *this};
         } else if (*this < flipped) {
@@ -399,7 +399,7 @@ struct Shape {
     }
 
     Shape equivalentHalve() const {
-        Shape flipped = flip().rotate(PART / 2);
+        Shape flipped = flip();
         if (flipped < *this) {
             return flipped;
         } else {
